@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>备份链管理 · 中间恢复点清退</title>
+<style>
+  :root { --bd:#d8dee4; --mut:#656d76; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:#1f2328; background:var(--bg); }
+  header { background:#24292f; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:#b6c2cf; font-size:13px; }
+  main { max-width:1080px; margin:20px auto; padding:0 16px; display:grid; gap:16px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--bd); font-size:13px; }
+  th { color:var(--mut); font-weight:600; background:#f6f8fa; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; }
+  .tag.full { background:#ddf4ff; color:#0969da; }
+  .tag.inc { background:#fbefff; color:#8250df; }
+  .tag.zero { background:#fff8c5; color:var(--warn); }
+  button { border:1px solid var(--bd); background:#f6f8fa; border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#eaeef2; }
+  button.primary { background:#1f883d; color:#fff; border-color:#1a7f37; }
+  button.primary:hover { background:#1a7f37; }
+  button.danger { color:var(--err); border-color:#ffc1c7; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  a.dl { color:#0969da; text-decoration:none; }
+  a.dl:hover { text-decoration:underline; }
+  #flash { position:fixed; right:20px; top:20px; min-width:280px; max-width:420px; display:grid; gap:8px; z-index:10; }
+  .toast { padding:10px 14px; border-radius:8px; color:#fff; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.15); white-space:pre-wrap; }
+  .toast.ok { background:var(--ok); } .toast.err { background:var(--err); } .toast.info { background:#57606a; }
+  .muted { color:var(--mut); font-size:12px; }
+  .state-ready { color:var(--warn); font-weight:600; }
+  .state-published { color:var(--ok); font-weight:600; }
+  .state-stale { color:var(--err); font-weight:600; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>备份链管理 · 中间恢复点清退</h1>
+  <p>定长块增量链 · 缺省块向前继承 · 显式清零块还原为零 · 清退只并入指针、不生成临时整盘</p>
+</header>
+<div id="flash"></div>
+<main>
+  <section class="card">
+    <h2>链状态 <span id="meta" class="muted"></span></h2>
+    <table>
+      <thead><tr><th>编号</th><th>类型</th><th>说明</th><th>显式块/清零块</th><th>创建时间(UTC)</th><th>操作</th></tr></thead>
+      <tbody id="backups"></tbody>
+    </table>
+    <p class="muted" style="margin-bottom:0">
+      清退后编号保留原 seq（出现缺口、不重排），其余恢复点还原内容逐字节不变。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>清退任务（准备 → 发布 两阶段）</h2>
+    <table>
+      <thead><tr><th>任务</th><th>清退对象</th><th>基线版本</th><th>并入块数</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="6" class="muted">暂无任务</td></tr></tbody>
+    </table>
+    <p class="muted" style="margin-bottom:0">
+      准备期间原链完全不变、仍可下载还原；发布用链版本做乐观并发：同一旧链上先发布者生效，后发布者报 409 并提示重试。
+    </p>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+function toast(msg, kind='info') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = msg;
+  $('#flash').appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+  return data;
+}
+function shortId(id) { return id.length > 10 ? id.slice(0, 8) + '…' : id; }
+
+async function refresh() {
+  const snap = await api('/api/chain');
+  $('#meta').textContent =
+    ` · 链版本 v${snap.chain_version} · 块 ${snap.block_count} × ${snap.block_size}B = ${snap.block_size*snap.block_count}B`;
+  const n = snap.backups.length;
+  $('#backups').innerHTML = snap.backups.map((b, i) => {
+    const evictable = (i !== 0 && i !== n-1);
+    return `<tr>
+      <td class="mono">P${b.seq}</td>
+      <td><span class="tag ${b.kind}">${b.kind === 'full' ? '全备' : '增量'}</span></td>
+      <td>${b.label}</td>
+      <td>${b.explicit_blocks} / <span class="tag zero">${b.zero_blocks}</span></td>
+      <td class="mono">${b.created_at}</td>
+      <td class="row">
+        <a class="dl" href="/backups/${b.id}/download">下载还原镜像</a>
+        <button class="danger" ${evictable ? '' : 'disabled title="全备与末端恢复点不可清退"'}
+                onclick="prepare('${b.id}')">清退此点</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const jobs = await api('/api/jobs');
+  $('#jobs').innerHTML = jobs.length ? jobs.map(j => `<tr>
+      <td class="mono">${shortId(j.id)}</td>
+      <td class="mono">${shortId(j.evict_id)}</td>
+      <td>v${j.based_on_version}</td>
+      <td>${j.merged_blocks ?? '—'}</td>
+      <td class="state-${j.state}">${ {ready:'待发布',published:'已发布',stale:'已作废(需重试)'}[j.state] || j.state }</td>
+      <td class="row">
+        ${j.state === 'ready'
+          ? `<button class="primary" onclick="publish('${j.id}')">发布</button>
+             <button onclick="abandon('${j.id}')">放弃</button>`
+          : ''}
+      </td>
+    </tr>`).join('') : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+}
+
+async function prepare(id) {
+  try {
+    const r = await api(`/api/backups/${id}/prepare`, {method:'POST'});
+    toast(`已在暂存区准备：清退 P${r.evict_seq}，${r.merged_blocks} 个块将并入 P${r.successor_seq}。原链仍可用，确认后请发布。`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function publish(id) {
+  try {
+    const r = await api(`/api/jobs/${id}/publish`, {method:'POST'});
+    toast(`发布成功：P${r.evicted_seq} 已清退，块并入 P${r.successor_seq}，链版本升至 v${r.new_version}`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'err'); refresh(); }
+}
+async function abandon(id) {
+  try { await api(`/api/jobs/${id}/abandon`, {method:'POST'}); toast('已放弃该任务，原链未受影响', 'info'); refresh(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

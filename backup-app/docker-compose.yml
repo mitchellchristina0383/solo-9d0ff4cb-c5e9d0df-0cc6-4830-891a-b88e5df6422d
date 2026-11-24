@@ -1,0 +1,16 @@
+services:
+  backup-app:
+    build: .
+    image: backup-chain-app:latest
+    container_name: backup-chain-app
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库（块存储、恢复点、合并任务全部在这里面）
+      BACKUP_DB: /data/backups.db
+    volumes:
+      - backup-data:/data
+    restart: unless-stopped
+
+volumes:
+  backup-data:
