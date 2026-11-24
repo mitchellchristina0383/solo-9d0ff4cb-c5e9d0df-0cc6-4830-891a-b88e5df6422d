@@ -43,7 +43,7 @@
 <body>
 <header>
   <h1>备份链管理 · 中间恢复点清退</h1>
-  <p>定长块增量链 · 缺省块向前继承 · 显式清零块还原为零 · 清退只并入指针、不生成临时整盘</p>
+  <p>定长块增量链 · 缺省块向前继承 · 显式清零块还原为零 · 每槽位索引直取所选点及以前最后写入 · 清退只并入指针、不生成临时整盘</p>
 </header>
 <div id="flash"></div>
 <main>
@@ -55,6 +55,7 @@
     </table>
     <p class="muted" style="margin-bottom:0">
       清退后编号保留原 seq（出现缺口、不重排），其余恢复点还原内容逐字节不变。
+      还原按槽位索引直达“所选恢复点及以前最后一次写入”，跳过其后被覆盖的指针，深链下载也不做全链折叠。
     </p>
   </section>
 
@@ -90,7 +91,8 @@ function shortId(id) { return id.length > 10 ? id.slice(0, 8) + '…' : id; }
 async function refresh() {
   const snap = await api('/api/chain');
   $('#meta').textContent =
-    ` · 链版本 v${snap.chain_version} · 块 ${snap.block_count} × ${snap.block_size}B = ${snap.block_size*snap.block_count}B`;
+    ` · 链版本 v${snap.chain_version} · 块 ${snap.block_count} × ${snap.block_size}B = ${snap.block_size*snap.block_count}B` +
+    ` · 指针 ${snap.pointer_rows} 条 · 槽位索引 ${snap.slot_index_rows} 条`;
   const n = snap.backups.length;
   $('#backups').innerHTML = snap.backups.map((b, i) => {
     const evictable = (i !== 0 && i !== n-1);

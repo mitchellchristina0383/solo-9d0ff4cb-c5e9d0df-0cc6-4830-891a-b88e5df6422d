@@ -84,15 +84,20 @@ def create_app(db_path: str | None = None) -> Flask:
     # --------------------------------------------------------- download
     @app.get("/backups/<backup_id>/download")
     def download(backup_id: str):
-        # 预读元数据（走请求连接）
-        conn = db()
-        target = chain.get_backup(conn, backup_id)
-        block_size, block_count = chain.disk_spec(conn)
+        # 下载开始时立即开启一个只读事务，把 WAL 快照钉在这一刻已发布的链上。
+        # 之后即使并发发布清退，本次下载的每个槽位读到的都是同一份链。
         db_path = app.config["DB_PATH"]
+        stream_conn = connect(db_path)
+        try:
+            stream_conn.execute("BEGIN")
+            target = chain.get_backup(stream_conn, backup_id)
+            block_size, block_count = chain.disk_spec(stream_conn)
+        except Exception:
+            stream_conn.close()
+            raise
 
         def generate():
-            # 流式迭代发生在请求上下文 teardown 之后，使用专用连接并自行关闭
-            stream_conn = connect(db_path)
+            # 流式迭代发生在请求上下文 teardown 之后，使用专用连接/快照并自行关闭
             try:
                 yield from chain.materialize_blocks(stream_conn, backup_id)
             finally:
@@ -102,6 +107,8 @@ def create_app(db_path: str | None = None) -> Flask:
         resp = Response(generate(), mimetype="application/octet-stream")
         resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         resp.headers["Content-Length"] = str(block_size * block_count)
+        # 客户端提前断开 / 不迭代时也保证连接被释放（close 幂等）
+        resp.call_on_close(stream_conn.close)
         return resp
 
     return app

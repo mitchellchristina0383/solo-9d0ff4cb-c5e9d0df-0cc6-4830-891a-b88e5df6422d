@@ -19,6 +19,7 @@ import hashlib
 import sqlite3
 
 from .chain import ZERO_HASH, set_meta
+from .db import insert_pointer
 
 BLOCK_SIZE = 64
 BLOCK_COUNT = 8
@@ -78,11 +79,7 @@ def seed_if_empty(conn: sqlite3.Connection) -> bool:
             is_zero = letter is None
             content = b"" if is_zero else block_content(letter, idx)
             h = _ensure_block(conn, content, is_zero)
-            conn.execute(
-                "INSERT INTO backup_blocks(backup_id, block_index, block_hash, is_zero) "
-                "VALUES(?, ?, ?, ?)",
-                (backup_id, idx, h, 1 if is_zero else 0),
-            )
+            insert_pointer(conn, backup_id, seq, idx, h, 1 if is_zero else 0)
     conn.commit()
     return True
 

@@ -105,6 +105,12 @@ def chain_snapshot(conn: sqlite3.Connection) -> dict:
         "chain_version": chain_version(conn),
         "block_size": block_size,
         "block_count": block_count,
+        "pointer_rows": conn.execute(
+            "SELECT COUNT(*) AS c FROM backup_blocks"
+        ).fetchone()["c"],
+        "slot_index_rows": conn.execute(
+            "SELECT COUNT(*) AS c FROM slot_pointers"
+        ).fetchone()["c"],
         "backups": backups,
     }
 
@@ -122,42 +128,33 @@ def _block_content(conn: sqlite3.Connection, block_hash: str) -> bytes:
     return row["content"]
 
 
+SLOT_POINTER_SQL = (
+    "SELECT block_hash, is_zero FROM slot_pointers "
+    "WHERE block_index = ? AND seq <= ? ORDER BY seq DESC LIMIT 1"
+)
+
+
 def materialize_blocks(conn: sqlite3.Connection, backup_id: str):
     """按块生成还原镜像的生成器（流式响应，不落临时整盘）。
 
-    缺省块沿链向前继承；显式清零块产出全零字节。
+    缺省块向前继承；显式清零块产出全零字节。每个槽位直接查索引
+    “目标点及以前 seq 最大的那条指针”，不再逐恢复点折叠整条链，
+    因此深链的取块开销与链中“实际保存的指针数”无关，只与该槽位的
+    索引查找（主键倒序 LIMIT 1）有关。
     """
     target = get_backup(conn, backup_id)
     block_size, block_count = disk_spec(conn)
-    ordered = [b for b in list_backups(conn) if b["seq"] <= target["seq"]]
-    if not ordered:  # pragma: no cover - 目标本身存在时不可能为空
-        raise NotFoundError("链为空")
-
-    # 沿链折叠出目标恢复点每个槽位的最终指针
-    state: dict[int, tuple[str, int]] = {}
-    for b in ordered:
-        for r in list_pointers(conn, b["id"]):
-            state[r["block_index"]] = (r["block_hash"], r["is_zero"])
-
-    full = ordered[0]
-    if full["kind"] != "full":  # pragma: no cover - 种子数据保证
-        raise DomainError("链首不是全备")
-    full_indices = {r["block_index"] for r in list_pointers(conn, full["id"])}
-    missing = [i for i in range(block_count) if i not in state and i not in full_indices]
-    if missing:
-        raise DomainError(f"槽位 {missing[:5]} 无法沿链解析，数据不完整")
+    target_seq = target["seq"]
 
     for i in range(block_count):
-        pointer = state.get(i)
-        if pointer is None:
-            # 理论上不会到这里：全备应覆盖全部槽位
-            yield b"\x00" * block_size
-            continue
-        block_hash, is_zero = pointer
-        if is_zero:
+        # 一次索引点查：目标点及以前最后一次写入（跳过其后被覆盖的指针）
+        row = conn.execute(SLOT_POINTER_SQL, (i, target_seq)).fetchone()
+        if row is None:
+            raise DomainError(f"槽位 {i} 无法沿链解析，数据不完整")
+        if row["is_zero"]:
             yield b"\x00" * block_size
         else:
-            yield _block_content(conn, block_hash)
+            yield _block_content(conn, row["block_hash"])
 
 
 # -------------------------------------------------------------- eviction --
@@ -289,7 +286,17 @@ def publish_eviction(conn: sqlite3.Connection, job_id: str) -> dict:
         # 2) 删除待清退恢复点的指针与恢复点本身（块内容因哈希共享而保留）
         conn.execute("DELETE FROM backup_blocks WHERE backup_id = ?", (evict_id,))
         conn.execute("DELETE FROM backups WHERE id = ?", (evict_id,))
-        # 3) 任务落账、链版本 +1
+        # 3) 索引只改参与合并的两个点：
+        #    清退点的索引行全部移除；后继的索引行按新指针整体重建。
+        #    其它恢复点的索引行一行不动，索引仍与“已发布指针”逐行对应。
+        conn.execute("DELETE FROM slot_pointers WHERE seq = ?", (ordered[position]["seq"],))
+        conn.execute("DELETE FROM slot_pointers WHERE seq = ?", (succ["seq"],))
+        conn.executemany(
+            "INSERT INTO slot_pointers(block_index, seq, block_hash, is_zero) "
+            "VALUES(?, ?, ?, ?)",
+            [(idx, succ["seq"], h, z) for idx, (h, z) in sorted(merged.items())],
+        )
+        # 4) 任务落账、链版本 +1
         conn.execute(
             "UPDATE merge_jobs SET state = 'published', published_at = ? WHERE id = ?",
             (_now(), job_id),
@@ -334,6 +341,7 @@ def abandon_job(conn: sqlite3.Connection, job_id: str) -> dict:
     job = get_job(conn, job_id)
     if job["state"] != "ready":
         raise ConflictError(f"任务状态为 {job['state']}，不能放弃")
+    # 暂存区只删本任务的行；原链与索引在准备阶段从未改动，无需回滚
     conn.execute("DELETE FROM staged_blocks WHERE job_id = ?", (job_id,))
     conn.execute("DELETE FROM merge_jobs WHERE id = ?", (job_id,))
     conn.commit()
